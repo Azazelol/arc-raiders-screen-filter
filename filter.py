@@ -1,0 +1,190 @@
+import ctypes
+import ctypes.wintypes
+import atexit
+import signal
+import sys
+import winreg
+import keyboard
+
+# === Windows API ===
+
+gdi32 = ctypes.windll.gdi32
+user32 = ctypes.windll.user32
+
+
+def get_dc():
+    return user32.GetDC(0)
+
+
+def release_dc(hdc):
+    user32.ReleaseDC(0, hdc)
+
+
+def get_gamma_ramp(hdc):
+    ramp = (ctypes.c_ushort * 256 * 3)()
+    result = gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(ramp))
+    if not result:
+        print("[WARN] GetDeviceGammaRamp failed")
+    return ramp
+
+
+def set_gamma_ramp(hdc, ramp):
+    result = gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
+    if not result:
+        print("[WARN] SetDeviceGammaRamp failed — Windows rejected the gamma ramp")
+    return result
+
+
+def ensure_gamma_range():
+    """
+    Windows ограничивает диапазон SetDeviceGammaRamp.
+    Ключ реестра GdiICMGammaRange = 256 снимает ограничение.
+    Требует прав администратора.
+    """
+    key_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM"
+    value_name = "GdiICMGammaRange"
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0,
+                             winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+        try:
+            val, _ = winreg.QueryValueEx(key, value_name)
+            winreg.CloseKey(key)
+            if val == 256:
+                return True
+        except FileNotFoundError:
+            winreg.CloseKey(key)
+    except FileNotFoundError:
+        pass
+
+    # Пробуем установить значение
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, key_path, 0,
+                                 winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+        winreg.SetValueEx(key, value_name, 0, winreg.REG_DWORD, 256)
+        winreg.CloseKey(key)
+        print("[OK] Registry: GdiICMGammaRange set to 256 (extended range enabled)")
+        print("[!]  Может потребоваться перезагрузка ПК для вступления в силу.")
+        return True
+    except PermissionError:
+        print("[ERR] Нет прав для записи в реестр. Запустите от администратора!")
+        return False
+
+
+# === Построение гамма-кривой ===
+
+def build_gamma_ramp(brightness=1.0, contrast=1.0, gamma=1.0):
+    ramp = (ctypes.c_ushort * 256 * 3)()
+
+    for i in range(256):
+        value = i / 255.0
+        value = pow(value, gamma)
+        value = (value - 0.5) * contrast + 0.5
+        value *= brightness
+        value = max(0.0, min(1.0, value))
+        output = int(value * 65535)
+
+        ramp[0][i] = output
+        ramp[1][i] = output
+        ramp[2][i] = output
+
+    return ramp
+
+
+# === Пресеты ===
+
+PRESETS = {
+    "off":    {"brightness": 1.0, "contrast": 1.0, "gamma": 1.0},
+    "medium": {"brightness": 1.2, "contrast": 1.2, "gamma": 0.5},
+    "strong": {"brightness": 1.3, "contrast": 1.3, "gamma": 0.35},
+}
+
+preset_names = list(PRESETS.keys())
+current_index = 0
+
+# === Сохранить оригинальную гамму ===
+
+hdc = get_dc()
+original_ramp = get_gamma_ramp(hdc)
+release_dc(hdc)
+
+
+def restore_original():
+    hdc = get_dc()
+    set_gamma_ramp(hdc, original_ramp)
+    release_dc(hdc)
+    print("Gamma restored")
+
+
+atexit.register(restore_original)
+signal.signal(signal.SIGINT, lambda *_: exit(0))
+
+
+# === Применение фильтра ===
+
+def apply_filter(brightness, contrast, gamma):
+    hdc = get_dc()
+    ramp = build_gamma_ramp(brightness, contrast, gamma)
+    ok = set_gamma_ramp(hdc, ramp)
+    release_dc(hdc)
+    return ok
+
+
+def cycle_preset():
+    global current_index
+    current_index = (current_index + 1) % len(preset_names)
+    name = preset_names[current_index]
+    preset = PRESETS[name]
+    ok = apply_filter(**preset)
+    status = "OK" if ok else "FAIL"
+    print(f"Preset: {name} [{status}]  (b={preset['brightness']}, c={preset['contrast']}, g={preset['gamma']})")
+
+
+def reset_filter():
+    global current_index
+    current_index = 0
+    apply_filter(1.0, 1.0, 1.0)
+    print("Filter OFF")
+
+
+# === Горячие клавиши ===
+
+keyboard.add_hotkey('b', cycle_preset)
+keyboard.add_hotkey('n', reset_filter)
+
+
+# === Main ===
+
+def main():
+    print("=== ARC Raiders Screen Filter ===")
+    print()
+
+    # Проверяем/устанавливаем расширенный диапазон гаммы
+    ensure_gamma_range()
+    print()
+
+    # Диагностика: пробуем применить тестовую гамму
+    print("[TEST] Applying test gamma ramp...")
+    test_ok = apply_filter(1.1, 1.0, 0.8)
+    if test_ok:
+        print("[TEST] SetDeviceGammaRamp works! Resetting...")
+        apply_filter(1.0, 1.0, 1.0)
+    else:
+        print("[TEST] SetDeviceGammaRamp FAILED.")
+        print("       Попробуйте:")
+        print("       1. Запустить от администратора")
+        print("       2. Перезагрузить ПК (если реестр был изменён)")
+        print("       3. Проверить настройки HDR в Windows (выключить HDR)")
+        print()
+
+    print("B   — переключить пресет")
+    print("N   — выключить фильтр")
+    print("F12 — выход")
+    print(f"Текущий пресет: {preset_names[current_index]}")
+    print()
+
+    keyboard.wait('F12')
+    print("Exiting...")
+
+
+if __name__ == "__main__":
+    main()
