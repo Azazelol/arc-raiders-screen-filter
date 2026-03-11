@@ -11,13 +11,58 @@ import keyboard
 gdi32 = ctypes.windll.gdi32
 user32 = ctypes.windll.user32
 
+# Структуры для EnumDisplayDevices
+DISPLAY_DEVICE_PRIMARY_DEVICE = 0x00000004
+
+class DISPLAY_DEVICE(ctypes.Structure):
+    _fields_ = [
+        ('cb', ctypes.wintypes.DWORD),
+        ('DeviceName', ctypes.wintypes.WCHAR * 32),
+        ('DeviceString', ctypes.wintypes.WCHAR * 128),
+        ('StateFlags', ctypes.wintypes.DWORD),
+        ('DeviceID', ctypes.wintypes.WCHAR * 128),
+        ('DeviceKey', ctypes.wintypes.WCHAR * 128),
+    ]
+
+
+def get_primary_monitor_name():
+    """Получить имя основного монитора"""
+    i = 0
+    while True:
+        device = DISPLAY_DEVICE()
+        device.cb = ctypes.sizeof(device)
+
+        if not user32.EnumDisplayDevicesW(None, i, ctypes.byref(device), 0):
+            break
+
+        # Проверяем флаг PRIMARY_DEVICE
+        if device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE:
+            return device.DeviceName
+
+        i += 1
+
+    # Если не нашли основной, возвращаем первый доступный
+    return None
+
 
 def get_dc():
+    """Получить DC только для основного монитора"""
+    monitor_name = get_primary_monitor_name()
+    if monitor_name:
+        # CreateDC для конкретного монитора
+        hdc = gdi32.CreateDCW(monitor_name, None, None, None)
+        if hdc:
+            return hdc
+
+    # Fallback на весь экран если что-то пошло не так
     return user32.GetDC(0)
 
 
 def release_dc(hdc):
-    user32.ReleaseDC(0, hdc)
+    """Освободить DC"""
+    # Для CreateDC используется DeleteDC, для GetDC - ReleaseDC
+    # Пробуем оба варианта (один вернёт 0, другой успешно выполнится)
+    gdi32.DeleteDC(hdc)
 
 
 def get_gamma_ramp(hdc):
