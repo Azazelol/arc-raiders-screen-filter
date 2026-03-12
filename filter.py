@@ -4,7 +4,8 @@ import atexit
 import signal
 import sys
 import winreg
-import keyboard
+import threading
+import time
 
 # === Windows API ===
 
@@ -117,7 +118,10 @@ def ensure_gamma_range():
 
 # === Построение гамма-кривой ===
 
-def build_gamma_ramp(brightness=1.0, contrast=1.0, gamma=1.0):
+def build_gamma_ramp(brightness=1.0, contrast=1.0, gamma=1.0, green_tint=0.0):
+    """
+    green_tint: 0.0-0.3 (0 = нет оттенка, >0 = зеленый оттенок как ПНВ)
+    """
     ramp = (ctypes.c_ushort * 256 * 3)()
 
     for i in range(256):
@@ -126,11 +130,15 @@ def build_gamma_ramp(brightness=1.0, contrast=1.0, gamma=1.0):
         value = (value - 0.5) * contrast + 0.5
         value *= brightness
         value = max(0.0, min(1.0, value))
-        output = int(value * 65535)
 
-        ramp[0][i] = output
-        ramp[1][i] = output
-        ramp[2][i] = output
+        # Применяем зеленый оттенок (усиливаем зеленый канал)
+        red_value = value * (1.0 - green_tint * 0.5)
+        green_value = value * (1.0 + green_tint)
+        blue_value = value * (1.0 - green_tint * 0.5)
+
+        ramp[0][i] = int(max(0.0, min(1.0, red_value)) * 65535)    # Red
+        ramp[1][i] = int(max(0.0, min(1.0, green_value)) * 65535)  # Green
+        ramp[2][i] = int(max(0.0, min(1.0, blue_value)) * 65535)   # Blue
 
     return ramp
 
@@ -138,9 +146,10 @@ def build_gamma_ramp(brightness=1.0, contrast=1.0, gamma=1.0):
 # === Пресеты ===
 
 PRESETS = {
-    "off":    {"brightness": 1.0, "contrast": 1.0, "gamma": 1.0},
-    "medium": {"brightness": 1.2, "contrast": 1.2, "gamma": 0.5},
-    "strong": {"brightness": 1.3, "contrast": 1.3, "gamma": 0.35},
+    "off":    {"brightness": 1.0, "contrast": 1.0, "gamma": 1.0, "green_tint": 0.0},
+    "light":  {"brightness": 1.1, "contrast": 1.1, "gamma": 0.7, "green_tint": 0.15},
+    "medium": {"brightness": 1.2, "contrast": 1.2, "gamma": 0.5, "green_tint": 0.2},
+    "strong": {"brightness": 1.3, "contrast": 1.3, "gamma": 0.35, "green_tint": 0.25},
 }
 
 preset_names = list(PRESETS.keys())
@@ -166,9 +175,9 @@ signal.signal(signal.SIGINT, lambda *_: exit(0))
 
 # === Применение фильтра ===
 
-def apply_filter(brightness, contrast, gamma):
+def apply_filter(brightness, contrast, gamma, green_tint=0.0):
     hdc = get_dc()
-    ramp = build_gamma_ramp(brightness, contrast, gamma)
+    ramp = build_gamma_ramp(brightness, contrast, gamma, green_tint)
     ok = set_gamma_ramp(hdc, ramp)
     release_dc(hdc)
     return ok
@@ -181,7 +190,8 @@ def cycle_preset():
     preset = PRESETS[name]
     ok = apply_filter(**preset)
     status = "OK" if ok else "FAIL"
-    print(f"Preset: {name} [{status}]  (b={preset['brightness']}, c={preset['contrast']}, g={preset['gamma']})")
+    tint_str = f", tint={preset['green_tint']}" if preset.get('green_tint', 0) > 0 else ""
+    print(f"Preset: {name} [{status}]  (b={preset['brightness']}, c={preset['contrast']}, g={preset['gamma']}{tint_str})")
 
 
 def reset_filter():
@@ -191,10 +201,50 @@ def reset_filter():
     print("Filter OFF")
 
 
-# === Горячие клавиши ===
+# === Горячие клавиши через GetAsyncKeyState ===
+# Virtual Key Codes — не зависят от раскладки (русская/английская)
+# VK_B (0x42) = физическая клавиша B/И
+# VK_N (0x4E) = физическая клавиша N/Т
 
-keyboard.add_hotkey('b', cycle_preset)
-keyboard.add_hotkey('n', reset_filter)
+VK_B = 0x42     # Клавиша B (или И на русской)
+VK_N = 0x4E     # Клавиша N (или Т на русской)
+VK_F12 = 0x7B   # F12
+
+b_pressed = False
+n_pressed = False
+f12_pressed = False
+stop_listener = threading.Event()
+
+def key_listener_thread():
+    """Поток для отслеживания клавиш через GetAsyncKeyState (работает даже при зажатых WASD)"""
+    global b_pressed, n_pressed, f12_pressed
+
+    while not stop_listener.is_set():
+        # Проверяем B
+        if user32.GetAsyncKeyState(VK_B) & 0x8000:
+            if not b_pressed:
+                b_pressed = True
+                cycle_preset()
+        else:
+            b_pressed = False
+
+        # Проверяем N
+        if user32.GetAsyncKeyState(VK_N) & 0x8000:
+            if not n_pressed:
+                n_pressed = True
+                reset_filter()
+        else:
+            n_pressed = False
+
+        # Проверяем F12
+        if user32.GetAsyncKeyState(VK_F12) & 0x8000:
+            if not f12_pressed:
+                f12_pressed = True
+                stop_listener.set()
+        else:
+            f12_pressed = False
+
+        time.sleep(0.05)  # 50ms между проверками
 
 
 # === Main ===
@@ -221,14 +271,19 @@ def main():
         print("       3. Проверить настройки HDR в Windows (выключить HDR)")
         print()
 
-    print("B   — переключить пресет")
-    print("N   — выключить фильтр")
-    print("F12 — выход")
+    print("B (И) — переключить пресет (работает на ходу, любая раскладка!)")
+    print("N (Т) — выключить фильтр")
+    print("F12   — выход")
     print(f"Текущий пресет: {preset_names[current_index]}")
     print()
 
-    keyboard.wait('F12')
-    print("Exiting...")
+    # Запуск потока отслеживания клавиш
+    listener = threading.Thread(target=key_listener_thread, daemon=True)
+    listener.start()
+
+    # Ждём сигнала выхода
+    stop_listener.wait()
+    print("\nExiting...")
 
 
 if __name__ == "__main__":
