@@ -118,17 +118,49 @@ def ensure_gamma_range():
 
 # === Построение гамма-кривой ===
 
-def build_gamma_ramp(brightness=1.0, contrast=1.0, gamma=1.0, green_tint=0.0):
+def adaptive_tone_curve(value, shadow_gamma, highlight_gamma, midpoint=0.5):
     """
+    Адаптивная тон-кривая: отдельная гамма для теней и светов
+
+    shadow_gamma < 1.0 → осветляет темные участки
+    highlight_gamma > 1.0 → затемняет яркие участки (защита от засветки)
+    midpoint → точка перехода между тенями и светами (обычно 0.5)
+    """
+    if value < midpoint:
+        # Тени: применяем shadow_gamma
+        normalized = value / midpoint
+        result = pow(normalized, shadow_gamma) * midpoint
+    else:
+        # Света: применяем highlight_gamma
+        normalized = (value - midpoint) / (1.0 - midpoint)
+        result = pow(normalized, highlight_gamma) * (1.0 - midpoint) + midpoint
+
+    return result
+
+
+def build_gamma_ramp(brightness=1.0, contrast=1.0, shadow_gamma=1.0, highlight_gamma=1.0, green_tint=0.0):
+    """
+    brightness: общая яркость (1.0 = нормально)
+    contrast: контраст (1.0 = нормально)
+    shadow_gamma: гамма для теней (< 1.0 = ярче тени)
+    highlight_gamma: гамма для светов (> 1.0 = темнее света, защита от засветки)
     green_tint: 0.0-0.3 (0 = нет оттенка, >0 = зеленый оттенок как ПНВ)
     """
     ramp = (ctypes.c_ushort * 256 * 3)()
 
     for i in range(256):
         value = i / 255.0
-        value = pow(value, gamma)
+
+        # Применяем адаптивную тон-кривую (вместо простой гаммы)
+        value = adaptive_tone_curve(value, shadow_gamma, highlight_gamma, midpoint=0.5)
+
+        # Контраст
         value = (value - 0.5) * contrast + 0.5
+
+        # Яркость
         value *= brightness
+
+        # Clamp
         value = max(0.0, min(1.0, value))
 
         # Применяем зеленый оттенок (усиливаем зеленый канал)
@@ -146,10 +178,13 @@ def build_gamma_ramp(brightness=1.0, contrast=1.0, gamma=1.0, green_tint=0.0):
 # === Пресеты ===
 
 PRESETS = {
-    "off":    {"brightness": 1.0, "contrast": 1.0, "gamma": 1.0, "green_tint": 0.0},
-    "light":  {"brightness": 1.1, "contrast": 1.1, "gamma": 0.7, "green_tint": 0.15},
-    "medium": {"brightness": 1.2, "contrast": 1.2, "gamma": 0.5, "green_tint": 0.2},
-    "strong": {"brightness": 1.3, "contrast": 1.3, "gamma": 0.35, "green_tint": 0.25},
+    # shadow_gamma < 1.0 = ярче тени (видно в темноте)
+    # highlight_gamma > 1.0 = темнее света (защита от дыма/вспышек)
+
+    "off":    {"brightness": 1.0, "contrast": 1.0, "shadow_gamma": 1.0, "highlight_gamma": 1.0, "green_tint": 0.0},
+    "light":  {"brightness": 1.05, "contrast": 1.05, "shadow_gamma": 0.7, "highlight_gamma": 1.2, "green_tint": 0.15},
+    "medium": {"brightness": 1.1, "contrast": 1.1, "shadow_gamma": 0.5, "highlight_gamma": 1.4, "green_tint": 0.2},
+    "strong": {"brightness": 1.15, "contrast": 1.15, "shadow_gamma": 0.35, "highlight_gamma": 1.6, "green_tint": 0.25},
 }
 
 preset_names = list(PRESETS.keys())
@@ -175,9 +210,9 @@ signal.signal(signal.SIGINT, lambda *_: exit(0))
 
 # === Применение фильтра ===
 
-def apply_filter(brightness, contrast, gamma, green_tint=0.0):
+def apply_filter(brightness, contrast, shadow_gamma, highlight_gamma, green_tint=0.0):
     hdc = get_dc()
-    ramp = build_gamma_ramp(brightness, contrast, gamma, green_tint)
+    ramp = build_gamma_ramp(brightness, contrast, shadow_gamma, highlight_gamma, green_tint)
     ok = set_gamma_ramp(hdc, ramp)
     release_dc(hdc)
     return ok
@@ -191,13 +226,13 @@ def cycle_preset():
     ok = apply_filter(**preset)
     status = "OK" if ok else "FAIL"
     tint_str = f", tint={preset['green_tint']}" if preset.get('green_tint', 0) > 0 else ""
-    print(f"Preset: {name} [{status}]  (b={preset['brightness']}, c={preset['contrast']}, g={preset['gamma']}{tint_str})")
+    print(f"Preset: {name} [{status}]  (sh={preset['shadow_gamma']:.2f}, hl={preset['highlight_gamma']:.2f}{tint_str})")
 
 
 def reset_filter():
     global current_index
     current_index = 0
-    apply_filter(1.0, 1.0, 1.0)
+    apply_filter(1.0, 1.0, 1.0, 1.0, 0.0)
     print("Filter OFF")
 
 
@@ -259,10 +294,10 @@ def main():
 
     # Диагностика: пробуем применить тестовую гамму
     print("[TEST] Applying test gamma ramp...")
-    test_ok = apply_filter(1.1, 1.0, 0.8)
+    test_ok = apply_filter(1.1, 1.0, 0.8, 1.0, 0.0)
     if test_ok:
         print("[TEST] SetDeviceGammaRamp works! Resetting...")
-        apply_filter(1.0, 1.0, 1.0)
+        apply_filter(1.0, 1.0, 1.0, 1.0, 0.0)
     else:
         print("[TEST] SetDeviceGammaRamp FAILED.")
         print("       Попробуйте:")
